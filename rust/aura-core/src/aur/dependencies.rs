@@ -11,6 +11,7 @@ use petgraph::graph::NodeIndex;
 use petgraph::Graph;
 use r2d2::ManageConnection;
 use r2d2::Pool;
+use r2d2::PooledConnection;
 use r2d2_alpm::Alpm;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::IntoParallelRefIterator;
@@ -335,9 +336,6 @@ where
                         .map_err(|es| Error::Resolutions(Box::new(es)))?;
                 }
                 None => {
-                    // FIXME Fri Feb 18 2022 Same here as above.
-                    drop(alpm);
-
                     debug!("{} may be an AUR package.", pr);
                     let path = pull_or_clone(fetch, clone_d, parent, &pkg)?;
                     debug!("Parsing .SRCINFO for {}", pkg);
@@ -349,7 +347,7 @@ where
                     let prov: HashSet<_> = info.pkgs.iter().map(|p| p.pkgname.clone()).collect();
 
                     // --- All possible deps to consider --- //
-                    let deps: HashSet<String> = info
+                    let mut deps: HashSet<String> = info
                         .base
                         .makedepends
                         .into_iter()
@@ -358,17 +356,22 @@ where
                         .chain(respect_checkdeps(nocheck, info.base.checkdepends))
                         .flat_map(|av| av.vec)
                         .map(strip_version)
-                        // To prevent false detection of dependency cycles
-                        // during build preparation.
-                        //
-                        // Consider the case of `mingw-w64-harfbuzz-icu`, a
-                        // split package found within `mingw-w64-harfbuzz`. The
-                        // former depends on the latter (at runtime), but they
-                        // are built as a pair during the same `makepkg`
-                        // invocation. So we don't have to consider normal
-                        // dependency relationships between them.
-                        .filter(|p| prov.contains(p).not())
-                        .collect();
+                        .map(|pkg| name_of_provider(&alpm, fetch, &pkg))
+                        .collect::<Result<HashSet<_>, _>>()?;
+
+                    // FIXME Fri Feb 18 2022 Same here as above.
+                    drop(alpm);
+
+                    // To prevent false detection of dependency cycles
+                    // during build preparation.
+                    //
+                    // Consider the case of `mingw-w64-harfbuzz-icu`, a
+                    // split package found within `mingw-w64-harfbuzz`. The
+                    // former depends on the latter (at runtime), but they
+                    // are built as a pair during the same `makepkg`
+                    // invocation. So we don't have to consider normal
+                    // dependency relationships between them.
+                    deps.retain(|p| prov.contains(p).not());
 
                     debug!("{} ({}) => {:?}", pr, name, deps);
 
@@ -483,6 +486,37 @@ where
         }
     }
 }
+
+/// Returns the name of a package, accounting for AUR packages with no exact matches that are
+/// provided for by another AUR package.
+fn name_of_provider<M, F, E>(alpm: &PooledConnection<M>, fetch: &F, pkg: &str) -> Result<String, Error<E>>
+where
+    M: ManageConnection<Connection = Alpm>,
+    F: Fn(&str) -> Result<Vec<crate::faur::Package>, E>,
+{
+    // We can return early if it's an official package
+    let official = {
+        let db = alpm.alpm.localdb();
+        db.pkg(pkg).is_ok() || db.pkgs().find_satisfier(pkg).is_some()
+    };
+    if official {
+        return Ok(pkg.to_string());
+    }
+    // Check if an exact match exists in the AUR
+    let info = crate::faur::info([pkg], fetch).map_err(Error::Faur)?;
+    if info.is_empty() {
+        // Check for a provider
+        crate::faur::provides(pkg, fetch).map_err(Error::Faur)
+            .map(|mut v| v.pop()
+                // FIXME Tue Jan 16 2025 See above for issue with user selection. This function
+                // would probably no longer be necessary with its implementation.
+                .map(|p| p.name)
+                .unwrap_or_else(|| pkg.to_string()))
+    } else {
+        Ok(pkg.to_string())
+    }
+}
+
 
 /// Given a collection of [`Buildable`] packages, determine a tiered order in
 /// which they should be built and installed together.
